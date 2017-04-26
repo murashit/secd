@@ -1,0 +1,7 @@
+[package]
+name = "secd"
+version = "0.1.0"
+authors = ["murashit <upturnpikepointandplace@gmail.com>"]
+
+[dependencies]
+combine = "*"
