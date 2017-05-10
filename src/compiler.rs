@@ -1,5 +1,6 @@
 use value::{Value, vec2cons};
-use vm::{Machine, Code, Global, CodeOp, Location, Position};
+use vm::{Machine, SharedCode, MutableCode, Global, CodeOp, Location, Position};
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ast {
@@ -39,16 +40,16 @@ impl Ast {
         Ast::List(former.to_owned(), Box::new(last))
     }
 
-    pub fn compile(&self, global: &Global) -> Result<Code, String> {
+    pub fn compile(&self, global: &Global) -> Result<SharedCode, String> {
         let mut env = Vec::new();
         let mut code = Vec::new();
         self.compile_helper(&mut env, &mut code, global)?;
-        Ok(code)
+        Ok(Rc::new(code.into_boxed_slice()))
     }
 
     fn compile_helper(&self,
                       env: &mut Env,
-                      code: &mut Code,
+                      code: &mut MutableCode,
                       global: &Global)
                       -> Result<(), String> {
         match *self {
@@ -66,11 +67,16 @@ impl Ast {
                 }
                 if let Some(&Ast::Symbol(ref name)) = form.get(0) {
                     if let Some(&Value::Macro(ref macro_code, _)) = global.get(name) {
-                        let mut macro_code = macro_code.to_owned();
-                        macro_code.remove(0); // 最後のRtnを削除
+
+                        // 最後のRtnを削除
+                        let mut owned_macro_code = Vec::with_capacity(macro_code.len());
+                        owned_macro_code.extend_from_slice(&macro_code[1..]);
+
                         let macro_args = form[1..].iter().map(|ast| ast.to_value()).collect();
                         let result =
-                            Machine::run(vec![macro_args], macro_code, &mut global.to_owned());
+                            Machine::run(vec![macro_args],
+                                         Rc::new(owned_macro_code.into_boxed_slice()),
+                                         &mut global.to_owned());
                         result
                             .unwrap()
                             .to_ast()
@@ -131,7 +137,7 @@ impl Ast {
     }
 }
 
-fn begin(body: &[Ast], env: &mut Env, code: &mut Code, global: &Global) -> Result<(), String> {
+fn begin(body: &[Ast], env: &mut Env, code: &mut MutableCode, global: &Global) -> Result<(), String> {
     for exp in body.iter().rev() {
         exp.compile_helper(env, code, global)?;
         code.push(CodeOp::Pop)
@@ -143,14 +149,14 @@ fn begin(body: &[Ast], env: &mut Env, code: &mut Code, global: &Global) -> Resul
 fn lambda(params: Ast,
           body: &[Ast],
           env: &mut Env,
-          code: &mut Code,
+          code: &mut MutableCode,
           global: &Global)
           -> Result<(), String> {
     let mut new_env = env;
     new_env.push(params);
     let mut body_code = vec![CodeOp::Rtn];
     begin(body, &mut new_env, &mut body_code, global)?;
-    code.push(CodeOp::Ldf(body_code));
+    code.push(CodeOp::Ldf(Rc::new(body_code.into_boxed_slice())));
     Ok(())
 }
 
@@ -158,7 +164,7 @@ fn if_(pred: &Ast,
        conseq: &Ast,
        alt: Option<&Ast>,
        env: &mut Env,
-       code: &mut Code,
+       code: &mut MutableCode,
        global: &Global)
        -> Result<(), String> {
     let mut conseq_code = vec![CodeOp::Join];
@@ -166,12 +172,13 @@ fn if_(pred: &Ast,
     let mut alt_code = vec![CodeOp::Join];
     alt.unwrap_or(&Ast::Undefined)
         .compile_helper(env, &mut alt_code, global)?;
-    code.push(CodeOp::Sel(conseq_code, alt_code));
+    code.push(CodeOp::Sel(Rc::new(conseq_code.into_boxed_slice()),
+                          Rc::new(alt_code.into_boxed_slice())));
     pred.compile_helper(env, code, global)?;
     Ok(())
 }
 
-fn apply(form: &[Ast], env: &mut Env, code: &mut Code, global: &Global) -> Result<(), String> {
+fn apply(form: &[Ast], env: &mut Env, code: &mut MutableCode, global: &Global) -> Result<(), String> {
     code.push(CodeOp::App(form[1..].len()));
     form[0].compile_helper(env, code, global)?;
     for ast in form[1..].iter().rev() {
@@ -183,7 +190,7 @@ fn apply(form: &[Ast], env: &mut Env, code: &mut Code, global: &Global) -> Resul
 fn define(head: &Ast,
           tail: &[Ast],
           env: &mut Env,
-          code: &mut Code,
+          code: &mut MutableCode,
           global: &Global)
           -> Result<(), String> {
     match *head {
@@ -211,7 +218,7 @@ fn define(head: &Ast,
 fn define_macro(head: &Ast,
                 tail: &[Ast],
                 env: &mut Env,
-                code: &mut Code,
+                code: &mut MutableCode,
                 global: &Global)
                 -> Result<(), String> {
     match *head {
