@@ -16,7 +16,7 @@ pub struct Machine {
 type Stack = Vec<Value>;
 pub type SharedCode = Rc<Box<[CodeOp]>>;
 pub type MutableCode = Vec<CodeOp>;
-// 次に実行するCodeOpを指す。1を起点とするインデックス。0でVMがhaltする。
+// 次に実行するCodeOpを指すインデックス。
 type CodePos = usize;
 pub type Env = Vec<Vec<Value>>;
 type Dump = Vec<DumpOp>;
@@ -56,12 +56,15 @@ impl Machine {
         let mut machine = Machine {
             stack: Vec::new(),
             env: env,
-            code: (code, clen),  // 1をベースとするインデックス。0になるとVMがhaltする。
+            code: (code, clen - 1),
             dump: Vec::new(),
         };
-        while machine.code.1 > 0 {
-            let op = &machine.code.0.clone()[machine.code.1 - 1];
-            machine.code.1 -= 1;
+        while machine.code.1 < ::std::usize::MAX {
+            // machine.code.0はRc<Box<[CodeOp]>>なのでclone()は軽量な処理。
+            let op = &machine.code.0.clone()[machine.code.1];
+            // usizeにはマイナス値がないのでwrapping_sub()を使う。
+            // code.1が0の時にwrapping_sum(1)を実行するとusize::MAXになる。
+            machine.code.1 = machine.code.1.wrapping_sub(1);
             machine.tick(op, global)?;
         }
         match machine.stack.pop() {
@@ -102,7 +105,7 @@ impl Machine {
                         let prev_stack = mem::replace(&mut self.stack, Vec::new());
                         let prev_env = mem::replace(&mut self.env, env);
                         let clen = code.len();
-                        let prev_code = mem::replace(&mut self.code, (code, clen));
+                        let prev_code = mem::replace(&mut self.code, (code, clen - 1));
 
                         self.dump
                             .push(DumpOp::DumpApp(prev_stack, prev_env, prev_code));
@@ -135,7 +138,7 @@ impl Machine {
                 } else {
                     conseq
                 };
-                let prev_code = mem::replace(&mut self.code, (code.clone(), code.len()));
+                let prev_code = mem::replace(&mut self.code, (code.clone(), code.len() - 1));
                 self.dump.push(DumpOp::DumpSel(prev_code));
                 Ok(())
             }
