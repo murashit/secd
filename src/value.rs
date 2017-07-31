@@ -1,6 +1,6 @@
 use std::fmt;
 use std::rc::Rc;
-use vm::{Code, Env};
+use vm::{SharedCode, Env};
 use compiler::Ast;
 use reader::read;
 
@@ -12,8 +12,8 @@ pub enum Value {
     Symbol(String),
     Cell(Rc<(Value, Value)>),
     Primitive(fn(Vec<Value>) -> Result<Value, String>),
-    Closure(Code, Env),
-    Macro(Code, Env),
+    Closure(SharedCode, Env),
+    Macro(SharedCode, Env),
     Undefined,
 }
 

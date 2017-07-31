@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fmt;
+use std::{fmt, mem};
+use std::rc::Rc;
 use compiler::Ast;
 use value::{Value, vec2cons};
 
@@ -8,12 +9,15 @@ pub type Global = HashMap<String, Value>;
 pub struct Machine {
     stack: Stack,
     env: Env,
-    code: Code,
+    code: (SharedCode, CodePos),
     dump: Dump,
 }
 
 type Stack = Vec<Value>;
-pub type Code = Vec<CodeOp>;
+pub type SharedCode = Rc<Box<[CodeOp]>>;
+pub type MutableCode = Vec<CodeOp>;
+// 次に実行するCodeOpを指すインデックス。
+type CodePos = usize;
 pub type Env = Vec<Vec<Value>>;
 type Dump = Vec<DumpOp>;
 
@@ -22,10 +26,10 @@ pub enum CodeOp {
     Ld(Location),
     Ldc(Ast),
     Ldg(String),
-    Ldf(Code),
+    Ldf(SharedCode),
     App(usize),
     Rtn,
-    Sel(Code, Code),
+    Sel(SharedCode, SharedCode),
     Join,
     Def(String),
     Defm(String),
@@ -42,77 +46,80 @@ pub enum Position {
 
 #[derive(Debug, Clone, PartialEq)]
 enum DumpOp {
-    DumpApp(Stack, Env, Code),
-    DumpSel(Code),
+    DumpApp(Stack, Env, (SharedCode, CodePos)),
+    DumpSel((SharedCode, CodePos)),
 }
 
 impl Machine {
-    pub fn run(env: Env, code: Code, global: &mut Global) -> Result<Value, String> {
+    pub fn run(env: Env, code: SharedCode, global: &mut Global) -> Result<Value, String> {
+        let clen = code.len();
         let mut machine = Machine {
             stack: Vec::new(),
             env: env,
-            code: code,
+            code: (code, clen - 1),
             dump: Vec::new(),
         };
-        loop {
-            if let Some(op) = machine.code.pop() {
-                machine.tick(op, global)?;
-            } else {
-                match machine.stack.pop() {
-                    Some(v) => return Ok(v),
-                    None => return Ok(Value::Undefined),
-                }
-            }
+        while machine.code.1 < ::std::usize::MAX {
+            // machine.code.0はRc<Box<[CodeOp]>>なのでclone()は軽量な処理。
+            let op = &machine.code.0.clone()[machine.code.1];
+            // usizeにはマイナス値がないのでwrapping_sub()を使う。
+            // code.1が0の時にwrapping_sum(1)を実行するとusize::MAXになる。
+            machine.code.1 = machine.code.1.wrapping_sub(1);
+            machine.tick(op, global)?;
+        }
+        match machine.stack.pop() {
+            Some(v) => return Ok(v),
+            None => return Ok(Value::Undefined),
         }
     }
 
-    fn tick(&mut self, op: CodeOp, global: &mut Global) -> Result<(), String> {
+    fn tick(&mut self, op: &CodeOp, global: &mut Global) -> Result<(), String> {
         match op {
-            CodeOp::Ld(location) => {
+            &CodeOp::Ld(location) => {
                 let value = get_var(&self.env, location)
                     .ok_or_else(|| "Runtime error: Ld")?;
                 self.stack.push(value);
                 Ok(())
             }
-            CodeOp::Ldc(ast) => Ok(self.stack.push(ast.to_value())),
-            CodeOp::Ldg(name) => {
+            &CodeOp::Ldc(ref ast) => Ok(self.stack.push(ast.to_value())),
+            &CodeOp::Ldg(ref name) => {
                 let value = global
-                    .get(&name)
+                    .get(name)
                     .ok_or_else(|| format!("unbound variable: {}", name))?;
                 self.stack.push(value.to_owned());
                 Ok(())
             }
-            CodeOp::Ldf(code) => {
+            &CodeOp::Ldf(ref code) => {
                 self.stack
-                    .push(Value::Closure(code, self.env.to_owned()));
+                    .push(Value::Closure(code.clone(), self.env.to_owned()));
                 Ok(())
             }
-            CodeOp::App(i) => {
+            &CodeOp::App(i) => {
                 let n = self.stack.len() - 1;
                 if i > n {
                     return Err("Runtime error: App".to_owned());
                 }
                 match self.stack.pop() {
                     Some(Value::Closure(code, mut env)) => {
-                        env.push(self.stack.drain(n - i..).collect());
+                        env.push(self.stack.split_off(n - i));
+                        let prev_stack = mem::replace(&mut self.stack, Vec::new());
+                        let prev_env = mem::replace(&mut self.env, env);
+                        let clen = code.len();
+                        let prev_code = mem::replace(&mut self.code, (code, clen - 1));
+
                         self.dump
-                            .push(DumpOp::DumpApp(self.stack.to_owned(),
-                                                  self.env.to_owned(),
-                                                  self.code.to_owned()));
-                        self.stack.clear();
-                        self.env = env;
-                        self.code = code;
+                            .push(DumpOp::DumpApp(prev_stack, prev_env, prev_code));
                         Ok(())
                     }
                     Some(Value::Primitive(procedure)) => {
-                        let result = (procedure)(self.stack.drain(n - i..).collect())?;
+                        let result = (procedure)(self.stack.split_off(n - i))?;
                         self.stack.push(result);
                         Ok(())
                     }
                     _ => Err("Runtime error: App".to_owned()),
                 }
             }
-            CodeOp::Rtn => {
+            &CodeOp::Rtn => {
                 if let (Some(s), Some(DumpOp::DumpApp(mut stack, env, code))) =
                     (self.stack.pop(), self.dump.pop()) {
                     stack.push(s);
@@ -124,17 +131,18 @@ impl Machine {
                     Err("Runtime error: Rtn".to_owned())
                 }
             }
-            CodeOp::Sel(conseq, alt) => {
+            &CodeOp::Sel(ref conseq, ref alt) => {
                 let value = self.stack.pop().ok_or_else(|| "Runtime error: Sel")?;
-                self.dump.push(DumpOp::DumpSel(self.code.to_owned()));
-                if value == Value::Boolean(false) {
-                    self.code = alt;
+                let code = if value == Value::Boolean(false) {
+                    alt
                 } else {
-                    self.code = conseq;
-                }
+                    conseq
+                };
+                let prev_code = mem::replace(&mut self.code, (code.clone(), code.len() - 1));
+                self.dump.push(DumpOp::DumpSel(prev_code));
                 Ok(())
             }
-            CodeOp::Join => {
+            &CodeOp::Join => {
                 if let Some(DumpOp::DumpSel(code)) = self.dump.pop() {
                     self.code = code;
                     Ok(())
@@ -142,20 +150,20 @@ impl Machine {
                     Err("Runtime error: Join".to_owned())
                 }
             }
-            CodeOp::Def(name) => {
+            &CodeOp::Def(ref name) => {
                 let value = self.stack.pop().ok_or_else(|| "Runtime error: Def")?;
-                global.insert(name, value);
+                global.insert(name.to_owned(), value);
                 Ok(())
             }
-            CodeOp::Defm(name) => {
+            &CodeOp::Defm(ref name) => {
                 if let Some(Value::Closure(code, env)) = self.stack.pop() {
-                    global.insert(name, Value::Macro(code, env));
+                    global.insert(name.to_owned(), Value::Macro(code, env));
                     Ok(())
                 } else {
                     unimplemented!()
                 }
             }
-            CodeOp::Pop => {
+            &CodeOp::Pop => {
                 self.stack.pop();
                 Ok(())
             }
